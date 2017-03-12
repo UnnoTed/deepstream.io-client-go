@@ -1,7 +1,10 @@
 package deepstream
 
 import (
+	"strconv"
 	"testing"
+
+	"sync"
 
 	"github.com/stretchr/testify/assert"
 	dry "github.com/ungerik/go-dry"
@@ -23,7 +26,7 @@ func TestDeepStreamSingleClient(t *testing.T) {
 
 	log.Info("WAITING FOR AUTH")
 	auth2, err := client2.Authenticate(map[string]interface{}{
-		"username": "kev2" + dry.RandomHEXString(10),
+		"username": dry.RandomHEXString(10),
 		"password": "okkk",
 	})
 	assert.NoError(t, err)
@@ -49,7 +52,7 @@ func TestDeepStreamSingleClient(t *testing.T) {
 	log.Debug("[TEST]: Connected")
 
 	auth, err := client.Authenticate(map[string]interface{}{
-		"username": "kev" + dry.RandomHEXString(10),
+		"username": dry.RandomHEXString(10),
 		"password": "hi",
 	})
 	assert.NoError(t, err)
@@ -73,29 +76,63 @@ func TestDeepStreamSingleClient(t *testing.T) {
 
 	err = client.Close()
 	assert.NoError(t, err)
+
+	log.Info("Closed")
 }
 
 func TestDeepStream(t *testing.T) {
-	return
-	// for i := 0; i < 100; i++ {
-	// 	clients = append(clients, &DeepStream{})
-	// 	err := clients[i].Connect("localhost:6020")
-	// 	assert.NoError(t, err)
-	// 	assert.NotNil(t, clients[i].Connection)
+	onChatList := []FutureMessage{}
 
-	// 	err = clients[i].Authenticate(map[string]interface{}{
-	// 		"user": "kev" + strconv.FormatInt(int64(i), 10),
-	// 	})
-	// 	assert.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		clients = append(clients, &DeepStream{})
+		c, err := clients[i].Connect(serverAddress)
+		assert.NoError(t, err)
+		assert.NotNil(t, clients[i].Connection)
+		<-c
 
-	// 	clients[i].Events.Subscribe("chat")
-	// 	go clients[i].Events.Emit("chat", []byte("hi"))
-	// }
+		a, err := clients[i].Authenticate(map[string]interface{}{
+			"user": "bot" + strconv.FormatInt(int64(i), 10),
+		})
+		assert.NoError(t, err)
+		<-a
 
-	// time.Sleep(5 * time.Second)
+		onSub, onChat, err := clients[i].Events.Subscribe("chat")
+		assert.NoError(t, err)
+		<-onSub
 
-	// for _, cl := range clients {
-	// 	err := cl.Close()
-	// 	assert.NoError(t, err)
-	// }
+		onChatList = append(onChatList, onChat)
+	}
+
+	var (
+		next     int
+		size     = len(clients) - 1
+		waiter   = &sync.WaitGroup{}
+		possible = [][]byte{}
+	)
+
+	for i, cl := range clients {
+		if i < size {
+			next = i + 1
+		} else {
+			next = 0
+		}
+
+		hi := []byte("hi" + strconv.FormatInt(int64(i), 10))
+		possible = append(possible, hi)
+		go cl.Events.Emit("chat", hi)
+
+		waiter.Add(1)
+		go func(onChatList []FutureMessage, next int) {
+			chat := <-onChatList[next]
+			assert.Contains(t, possible, chat.Data[1].Bytes)
+			waiter.Done()
+		}(onChatList, next)
+	}
+
+	waiter.Wait()
+
+	for _, cl := range clients {
+		err := cl.Close()
+		assert.NoError(t, err)
+	}
 }

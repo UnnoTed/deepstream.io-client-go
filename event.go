@@ -23,14 +23,14 @@ type bus struct {
 	// handlers so it can be controlled by the deepstream pkg
 	onSubscribe   func(*Subscription) (FutureMessage, FutureMessage)
 	onUnsubscribe func(*Subscription) (FutureMessage, FutureMessage)
-	onEmit        func(string, []byte)
+	onEmit        func(string, ...[]byte)
 
-	m *sync.RWMutex
+	mu *sync.RWMutex
 }
 
 func newEvent() *bus {
 	e := &bus{}
-	e.m = &sync.RWMutex{}
+	e.mu = &sync.RWMutex{}
 	e.subscriptions = map[string]*Subscription{}
 
 	return e
@@ -45,11 +45,11 @@ func (e *bus) Subscribe(name string) (FutureMessage, FutureMessage, error) {
 		return nil, nil, ErrorSubscriptionExists
 	}
 
-	e.m.Lock()
+	e.mu.Lock()
 	e.subscriptions[name] = &Subscription{
 		Name: name,
 	}
-	e.m.Unlock()
+	e.mu.Unlock()
 
 	slog.Debug("Event::Subscribe Running onSubscribe")
 	exp, onm := e.onSubscribe(e.subscriptions[name])
@@ -57,8 +57,8 @@ func (e *bus) Subscribe(name string) (FutureMessage, FutureMessage, error) {
 }
 
 func (e *bus) Unsubscribe(name string, cb func([]byte)) (FutureMessage, error) {
-	e.m.Lock()
-	defer e.m.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	// returns error when subscription already exists
 	if _, ok := e.subscriptions[name]; ok {
