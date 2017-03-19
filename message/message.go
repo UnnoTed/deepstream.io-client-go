@@ -3,6 +3,8 @@ package message
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/UnnoTed/deepstream.io-client-go/consts"
@@ -54,7 +56,7 @@ func String(msg []byte) string {
 
 // New takes topics, actions, events, strings, map[string]interface{}, [][]byte (from args) or []byte... to build a message
 func New(msg ...interface{}) []byte {
-	if len(msg) == 1 {
+	if len(msg) == 1 && reflect.TypeOf(msg[0]).Kind() == reflect.String {
 		return (&Message{}).Build(msg[0].(string))
 	}
 
@@ -65,6 +67,10 @@ func New(msg ...interface{}) []byte {
 
 	for i, part := range msg {
 		switch part.(type) {
+		default:
+			built += fmt.Sprintf("%v", part)
+		case []interface{}:
+			built += string(New(part.([]interface{})...))
 		case [][]byte:
 			psize := len(part.([][]byte)) - 1
 
@@ -157,6 +163,26 @@ func (m *Message) String() string {
 	return String(m.Raw)
 }
 
+func (m *Message) StringData() string {
+	msg := ""
+	total := len(m.Data) - 1
+	for i, data := range m.Data {
+		msg += data.String()
+
+		if i < total {
+			msg += consts.MessagePartSeparatorString
+		}
+	}
+
+	msg += consts.MessageSeparatorString
+
+	// m := string(msg)
+	// m = strings.Replace(m, consts.MessagePartSeparatorString, "|", -1)
+	// m = strings.Replace(m, consts.MessageSeparatorString, "+", -1)
+
+	return msg
+}
+
 // Equals checks if a message equals another
 func (m *Message) Equals(m2 *Message) bool {
 	return bytes.Equal(m.Raw, m2.Raw)
@@ -166,7 +192,10 @@ func (m *Message) Equals(m2 *Message) bool {
 // E|EVT|chat|hi+ matches expected: E|EVT|chat
 func (m *Message) Matches(m2 *Message) bool {
 	if bytes.Equal(m.Topic, m2.Topic) && bytes.Equal(m.Action, m2.Action) {
-		if (len(m.Data) > 0 && len(m.Data) <= len(m2.Data)) || (len(m.Data) == len(m2.Data)) {
+		if (len(m.Data) > 0 && len(m.Data) <= len(m2.Data)) ||
+			(len(m.Data) == len(m2.Data)) ||
+			(len(m.Data) == 0 && len(m2.Data) > 0) {
+
 			for i := range m.Data {
 				if !bytes.Equal(m.Data[i].Bytes, m2.Data[i].Bytes) {
 					return false

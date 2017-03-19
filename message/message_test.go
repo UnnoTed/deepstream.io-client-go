@@ -33,6 +33,7 @@ var (
 		{"A|A+", []interface{}{topics.Auth, actions.Ack}, true},
 		{"E|EVT|chat+", []interface{}{topics.Event, actions.Event, []byte("chat"), []byte("hi")}, true},
 		{"E|EVT|connectionStateChanged+", []interface{}{topics.Event, actions.Event, []byte("chat"), []byte("hi")}, false},
+		{"E|EVT+", []interface{}{topics.Event, actions.Event, []byte("911/truth"), []byte("jet fuel can't melt steel beams")}, true},
 	}
 )
 

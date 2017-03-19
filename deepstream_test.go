@@ -6,99 +6,111 @@ import (
 
 	"sync"
 
+	"github.com/UnnoTed/deepstream.io-client-go/message"
 	"github.com/stretchr/testify/assert"
 	dry "github.com/ungerik/go-dry"
 )
 
 var (
 	clients = []*DeepStream{}
+	dss     = []*DeepStream{{}, {}}
+	wait    sync.WaitGroup
 )
 
 const serverAddress = "localhost:6020"
 
+func init() {
+	wait.Add(len(dss))
+}
+
+func TestInit(t *testing.T) {
+	dry.RandSeedWithTime()
+
+	for _, ds := range dss {
+		go func(ds *DeepStream) {
+			connect, err := ds.Connect(serverAddress)
+			assert.NoError(t, err)
+			<-connect.Channels.Listen()
+
+			auth, err := ds.Authenticate(map[string]interface{}{
+				"username": dry.RandomHexString(10),
+				"password": dry.RandomHEXString(5),
+			})
+			assert.NoError(t, err)
+			<-auth.Channels.Listen()
+
+			wait.Done()
+		}(ds)
+	}
+
+	wait.Wait()
+}
+
 func TestDeepStreamSingleClient(t *testing.T) {
+	//wait.Wait()
+
 	// client 2
-	client2 := &DeepStream{}
-	connect2, err := client2.Connect(serverAddress)
-	assert.NoError(t, err)
-	assert.NotNil(t, client2.Connection)
-	<-connect2
-
-	log.Info("WAITING FOR AUTH")
-	auth2, err := client2.Authenticate(map[string]interface{}{
-		"username": dry.RandomHEXString(10),
-		"password": "okkk",
-	})
-	assert.NoError(t, err)
-	<-auth2
-	log.Info("AUTHENTICATED")
-
+	client2 := dss[1]
 	log.Info("SUBSCRIBE CLIENT 2")
 	sub2, _, err := client2.Events.Subscribe("chat")
 	assert.NoError(t, err)
 	_ = sub2
 	log.Info("WAITING SUBSCRIBE CLIENT 2")
-	<-sub2
+	<-sub2.Channels.Listen()
 	log.Info("DONE SUBSCRIBE CLIENT 2")
 
 	// client 1
 	log.Debug("[TEST]: Connecting...")
-	client := &DeepStream{}
-	connect, err := client.Connect(serverAddress)
-	assert.NoError(t, err)
-	assert.NotNil(t, client.Connection)
-	assert.NotNil(t, connect)
-	<-connect
-	log.Debug("[TEST]: Connected")
-
-	auth, err := client.Authenticate(map[string]interface{}{
-		"username": dry.RandomHEXString(10),
-		"password": "hi",
-	})
-	assert.NoError(t, err)
-	<-auth
-	log.Info("AUTHED")
-
+	client := dss[0]
 	sub, onChat, err := client.Events.Subscribe("chat")
-	<-sub
+	<-sub.Channels.Listen()
 	log.Info("SUBISCRIBEEEED!!")
 	assert.NoError(t, err)
 
 	client2.Events.Emit("chat", []byte("hi"))
-	hi := <-onChat
+	hi := <-onChat.Channels.Listen()
 	t.Log(hi.Data)
 	assert.Equal(t, "hi", hi.Data[1].String())
 
 	log.Info("EXPECTATION ENDED!")
 
-	err = client2.Close()
+	unsub, err := client.Events.Unsubscribe("chat")
 	assert.NoError(t, err)
+	<-unsub.Channels.Listen()
 
-	err = client.Close()
+	unsub2, err := client2.Events.Unsubscribe("chat")
 	assert.NoError(t, err)
+	<-unsub2.Channels.Listen()
 
-	log.Info("Closed")
+	//err = client2.Close()
+	//assert.NoError(t, err)
+	//
+	//err = client.Close()
+	//assert.NoError(t, err)
+	//
+	//log.Info("Closed")
 }
 
 func TestDeepStream(t *testing.T) {
-	onChatList := []FutureMessage{}
+	return
+	var onChatList []*ExpectedMessage
 
 	for i := 0; i < 10; i++ {
 		clients = append(clients, &DeepStream{})
 		c, err := clients[i].Connect(serverAddress)
 		assert.NoError(t, err)
 		assert.NotNil(t, clients[i].Connection)
-		<-c
+		<-c.Channels.Listen()
 
 		a, err := clients[i].Authenticate(map[string]interface{}{
 			"user": "bot" + strconv.FormatInt(int64(i), 10),
 		})
 		assert.NoError(t, err)
-		<-a
+		<-a.Channels.Listen()
 
 		onSub, onChat, err := clients[i].Events.Subscribe("chat")
 		assert.NoError(t, err)
-		<-onSub
+		<-onSub.Channels.Listen()
 
 		onChatList = append(onChatList, onChat)
 	}
@@ -122,8 +134,8 @@ func TestDeepStream(t *testing.T) {
 		go cl.Events.Emit("chat", hi)
 
 		waiter.Add(1)
-		go func(onChatList []FutureMessage, next int) {
-			chat := <-onChatList[next]
+		go func(onChatList []*ExpectedMessage, next int) {
+			chat := <-onChatList[next].Channels.Listen()
 			assert.Contains(t, possible, chat.Data[1].Bytes)
 			waiter.Done()
 		}(onChatList, next)
@@ -134,5 +146,17 @@ func TestDeepStream(t *testing.T) {
 	for _, cl := range clients {
 		err := cl.Close()
 		assert.NoError(t, err)
+	}
+}
+
+func BenchmarkMessageReader(b *testing.B) {
+	ds := dss[0]
+
+	msg := &message.Message{}
+	msg.Parse(msg.Build("C|CH+"))
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		ds.CheckMessage(msg.Raw)
 	}
 }

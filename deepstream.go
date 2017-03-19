@@ -10,6 +10,7 @@ import (
 
 	"sync"
 
+	"github.com/UnnoTed/deepstream.io-client-go/channels"
 	"github.com/UnnoTed/deepstream.io-client-go/consts"
 	"github.com/UnnoTed/deepstream.io-client-go/consts/actions"
 	"github.com/UnnoTed/deepstream.io-client-go/consts/events"
@@ -18,7 +19,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var log *zap.Logger
+var (
+	log  *zap.Logger
+	comu = &sync.RWMutex{}
+)
 
 func init() {
 	var err error
@@ -32,14 +36,26 @@ func init() {
 	log = log.Named("DeepStream")
 }
 
+type ExpectedMessage struct {
+	*message.Message
+
+	ID          string
+	ShouldClose bool
+	Matcher     *message.Matcher
+	// C           FutureMessage
+	Channels *channels.Channels
+}
+
 type DeepStream struct {
 	Connection *websocket.Conn
 	Closed     bool
 	Events     *bus
+	Records    *Records
 
-	expectedMessages []ExpectedMessage
+	Wait *sync.WaitGroup
+
+	expectedMessages map[string]*ExpectedMessage
 	LastMessage      []byte
-	lmc              chan []byte
 
 	state consts.ConnectionState
 	url   string
@@ -50,32 +66,58 @@ type DeepStream struct {
 }
 
 // Connect to a deepstream server
-func (ds *DeepStream) Connect(url string) (FutureMessage, error) {
+func (ds *DeepStream) Connect(url string) (*ExpectedMessage, error) {
+	log.Debug("[Connect] Connecting...")
+	comu.RLock()
 	if ds.Connection != nil {
+		comu.RUnlock()
+
 		log.Info("You're already connected.")
 		return nil, nil
 	}
 
-	ds.emu = &sync.RWMutex{}
-	ds.mu = &sync.RWMutex{}
+	comu.RUnlock()
+
+	if ds.Wait == nil {
+		ds.Wait = &sync.WaitGroup{}
+		ds.Wait.Add(1) // disables reader
+	}
+
+	if ds.emu == nil {
+		ds.emu = &sync.RWMutex{}
+	}
+
+	if ds.mu == nil {
+		ds.mu = &sync.RWMutex{}
+	}
+
+	if ds.expectedMessages == nil {
+		ds.expectedMessages = map[string]*ExpectedMessage{}
+	}
 
 	// sets the state to awaiting connection
 	ds.SetState(consts.ConnectionStateAwaitingConnection)
 
-	// watch for state changes
+	log.Debug("[Connect] Watching for state changes...")
+	// watch for state changes from server
 	go func(ds *DeepStream) {
 		if ds.expectingState {
 			return
 		}
 
 		// expect: connection state changed
-		ex := ds.ExpectMessage(topics.Event, actions.Event, events.ConnectionStateChanged)
-		defer close(ex)
+		ex, err := ds.ExpectMessage(topics.Event, actions.Event, events.ConnectionStateChanged)
+		if err != nil {
+			log.Error("error connection state changed", zap.Error(err))
+			return
+		}
 
+		defer ds.Unexpect(ex.ID)
 		ds.expectingState = true
 
+		c := ex.Channels.Listen()
 		for {
-			m := <-ex
+			m := <-c
 			if len(m.Data) > 0 {
 				ds.SetState(consts.ConnectionState(m.Data[len(m.Data)-1].String()))
 			}
@@ -98,42 +140,84 @@ func (ds *DeepStream) Connect(url string) (FutureMessage, error) {
 		url += "/deepstream"
 	}
 
+	log.Debug("[Connect] Starting websocket...")
+
 	// connects to the server
 	var err error
+	comu.Lock()
 	if ds.Connection, _, err = websocket.DefaultDialer.Dial(url, nil); err != nil {
+		comu.Unlock()
+		return nil, err
+	}
+	comu.Unlock()
+
+	log.Debug("[Connect] Running reader...")
+	go ds.reader()
+
+	// on connect
+	log.Debug("[Connect] Expecting connection challenge")
+	onConnect, err := ds.ExpectMessageOnce(topics.Connection, actions.Challenge)
+	if err != nil {
 		return nil, err
 	}
 
-	ds.lmc = make(chan []byte)
-	go ds.reader()
-
-	log.Debug("Expecting message once")
-	ex := ds.ExpectMessageOnce(topics.Connection, actions.Challenge)
-
-	onConnect := ds.ExpectMessageOnce(topics.Connection, actions.Challenge)
-	go func(onConnect FutureMessage, ds *DeepStream) {
+	go func(onConnect *ExpectedMessage, ds *DeepStream) {
 		log.Debug("Waiting on Connect")
-		<-onConnect
-		log.Debug("on connect OK, closed = false")
+		<-onConnect.Channels.Listen()
 
+		log.Debug("on connect OK, closed = false")
 		ds.SetState(consts.ConnectionStateOpen)
 
 		ds.mu.Lock()
 		ds.Closed = false
 		ds.mu.Unlock()
+
+		// enable reader
+		ds.Wait.Done()
 	}(onConnect, ds)
+
+	// on redirect
+	onRedirect, err := ds.ExpectMessage(topics.Connection, actions.Redirect)
+	if err != nil {
+		return nil, err
+	}
+
+	go func(onRedirect *ExpectedMessage, ds *DeepStream) {
+		c := onRedirect.Channels.Listen()
+
+		for {
+			msg := <-c
+
+			comu.Lock()
+			ds.Connection = nil
+			comu.Unlock()
+
+			connect, err := ds.Connect(msg.Data[0].String())
+			if err != nil {
+				log.Error("error while reconnecting", zap.Error(err))
+			}
+
+			<-connect.Channels.Listen()
+		}
+	}(onRedirect, ds)
 
 	log.Debug("Emiting...")
 
 	// send challenge response
 	go ds.Emit(message.New(topics.Connection, actions.ChallengeResponse, ds.url))
 
-	ds.Events = newEvent()
-	// ds.Events.onUnsubscribe = ds.onUnsubscribe
-	ds.Events.onSubscribe = ds.onSubscribe
-	ds.Events.onEmit = ds.onEmit
+	// insert events handlers
+	if ds.Events == nil {
+		ds.Events = newEvent()
+		ds.Events.ds = ds
+	}
 
-	return ex, err
+	if ds.Records == nil {
+		ds.Records = newRecords()
+		ds.Records.ds = ds
+	}
+
+	return onConnect, err
 }
 
 // Emit sends a message to the ws as text
@@ -174,7 +258,7 @@ func (ds *DeepStream) State() consts.ConnectionState {
 }
 
 // Authenticate sends a auth request to the deepstream server
-func (ds *DeepStream) Authenticate(data map[string]interface{}) (FutureMessage, error) {
+func (ds *DeepStream) Authenticate(data map[string]interface{}) (*ExpectedMessage, error) {
 	ds.SetState(consts.ConnectionStateAuthenticating)
 
 	log.Info("Sending Auth")
@@ -183,7 +267,11 @@ func (ds *DeepStream) Authenticate(data map[string]interface{}) (FutureMessage, 
 		return nil, err
 	}
 
-	ex := ds.ExpectMessageOnce(topics.Auth, actions.Ack)
+	ex, err := ds.ExpectMessageOnce(topics.Auth, actions.Ack)
+	if err != nil {
+		return nil, err
+	}
+
 	go ds.Emit(message.New(topics.Auth, actions.Request, string(j)))
 
 	return ex, nil
@@ -210,16 +298,19 @@ func (ds *DeepStream) Close() error {
 	return nil
 }
 
+// reader keeps a loop running waiting for messages
+// after the message is parsed it checks if the message is expected
+// if expected: it sends the message through a channel
 func (ds *DeepStream) reader() {
-	var (
-		toRemove []int
-		first    = true
-	)
+	var first = true
 
 	for {
+		comu.RLock()
 		if ds.Connection == nil {
+			comu.RUnlock()
 			return
 		}
+		comu.RUnlock()
 
 		log.Debug("Waiting for next message...")
 		var err error
@@ -231,10 +322,11 @@ func (ds *DeepStream) reader() {
 			ds.mu.RUnlock()
 			return
 		}
-
 		ds.mu.RUnlock()
-		toRemove = nil
-		first = false
+
+		if first {
+			first = false
+		}
 
 		if err != nil {
 			if _, ok := err.(*websocket.CloseError); ok {
@@ -251,6 +343,11 @@ func (ds *DeepStream) reader() {
 			go ds.Emit(message.MessagePong)
 			continue
 
+			// connection rejected
+		} else if bytes.Equal(ds.LastMessage, message.MessageReject) {
+			ds.Connection = nil
+			return
+
 			// waits for auth
 		} else if bytes.Equal(ds.LastMessage, message.MessageAuthenticate) {
 			log.Debug("WAITING AUTH")
@@ -258,129 +355,122 @@ func (ds *DeepStream) reader() {
 
 		log.Debug("Parsing message...")
 
-		// parse message
-		messages, err := message.Parse(ds.LastMessage)
-		if err != nil {
-			log.Error("Error parsing multiple messages", zap.Error(err))
-		}
+		ds.CheckMessage(ds.LastMessage)
 
-		for _, m := range messages {
-			log.Debug("Checking for expected message",
-				zap.String("msg", m.String()))
-
-			ds.emu.RLock()
-			// check if each expected message matches the current message
-			// when the message is expected only once, the channel is closed
-			for i, ex := range ds.expectedMessages {
-				if ex.ShouldClose {
-					log.Debug("Expected message should be found once", zap.String("msg", ex.Message.String()))
-				}
-
-				// compare messages
-				if ex.Message.Matches(m) {
-					log.Debug("Found expected message",
-						zap.String("expected", ex.Message.String()),
-						zap.String("current", m.String()))
-
-					// sends message through channel
-					ds.emu.RUnlock()
-					ex.Channel <- m
-					ds.emu.RLock()
-
-					// close channel when expected only once
-					if ex.ShouldClose {
-						close(ex.Channel)
-						log.Debug("Ended expectation for message", zap.String("msg", ex.Message.String()))
-						toRemove = append(toRemove, i)
-					}
-				} else {
-					log.Debug("Message didn't match", zap.String("expected", ex.Message.String()), zap.String("current", m.String()))
-				}
-			}
-			ds.emu.RUnlock()
-
-			ds.emu.Lock()
-			// remove messages expected only once
-			if len(toRemove) > 0 {
-				offset := 0
-				for _, i := range toRemove {
-					ds.expectedMessages = append(ds.expectedMessages[:i-offset], ds.expectedMessages[i+1-offset:]...)
-					offset++
-				}
-			}
-			ds.emu.Unlock()
-		}
+		log.Debug("waiting")
+		ds.Wait.Wait()
+		log.Debug("waited")
 	}
 }
 
-func (ds *DeepStream) onUnsubscribe(s *Subscription) (FutureMessage, message.OnMessage) {
-	exOnUnSub := ds.ExpectMessageOnce(topics.Event, actions.Ack, actions.Unsubscribe, []byte(s.Name))
+func (ds *DeepStream) CheckMessage(msg []byte) error {
+	// parse message
+	messages, err := message.Parse(msg)
+	if err != nil {
+		log.Error("Error parsing multiple messages", zap.Error(err))
+		return err
+	}
 
-	go ds.Emit(message.New(topics.Event, actions.Unsubscribe, s.Name))
+	for _, m := range messages {
+		log.Debug("Checking for expected message",
+			zap.String("msg", m.String()))
 
-	return exOnUnSub, nil
+		ds.emu.RLock()
+		// check if each expected message matches the current message
+		// when the message is expected only once, the channel is closed
+		for id, ex := range ds.expectedMessages {
+			if ex.ShouldClose {
+				log.Debug("Expected message should be found once", zap.String("msg", ex.Message.String()))
+			}
+
+			// compare messages
+			if ex.Message != nil && ex.Message.Matches(m) {
+				log.Debug("Found expected message",
+					zap.String("expected", ex.Message.String()),
+					zap.String("current", m.String()))
+
+				// ignores message when matcher doesn't match
+				if ex.Matcher != nil && !ex.Matcher.Matches(m) {
+					log.Warn("Ignoring message from matcher", zap.String("msg", ex.Message.String()))
+					continue
+				}
+
+				// sends message through channel
+				ds.emu.RUnlock()
+				log.Debug("SENDING MESSAGE TO CHANNELS", zap.String("msg", m.String()))
+				ex.Channels.Send(m)
+				ds.emu.RLock()
+
+				// close channel when expected only once
+				if ex.ShouldClose {
+					if err := ds.Unexpect(id); err != nil {
+						panic(err)
+					}
+					log.Debug("Ended expectation for message", zap.String("msg", ex.Message.String()))
+				}
+			} else {
+				log.Debug("Message didn't match", zap.String("expected", ex.Message.String()), zap.String("current", m.String()))
+			}
+		}
+		ds.emu.RUnlock()
+	}
+
+	return nil
 }
 
-// onSubscribe creates a expectMessage for subscription's ack and subscription's messages
-// then emits a subscription message to the deepstream server
-func (ds *DeepStream) onSubscribe(s *Subscription) (FutureMessage, FutureMessage) {
-	slog := log.With(zap.String("name", s.Name))
-	slog.Debug("DeepStream::onSubscribe")
-
-	// on receive a message
-	exOnMessage := ds.ExpectMessage(topics.Event, actions.Event, []byte(s.Name))
-
-	// on subscribe ack
-	exOnSub := ds.ExpectMessageOnce(topics.Event, actions.Ack, actions.Subscribe, []byte(s.Name))
-
-	// send the subscription request
-	slog.Debug("DeepStream::onSubscribe - emitting...")
-	go ds.Emit(message.New(topics.Event, actions.Subscribe, s.Name))
-
-	return exOnSub, exOnMessage
-}
-
-func (ds *DeepStream) onEmit(name string, data ...[]byte) {
-	ds.Emit(message.New(topics.Event, actions.Event, name, data))
-}
-
-type FutureMessage chan *message.Message
-type ExpectedMessage struct {
-	*message.Message
-	ShouldClose bool
-	Channel     FutureMessage
-}
-
-func (ds *DeepStream) expectMessage(shouldClose bool, topic topics.Topic, action actions.Action, data ...[]byte) FutureMessage {
+func (ds *DeepStream) expectMessage(shouldClose bool, matcher *message.Matcher, topic topics.Topic, action actions.Action, data ...[]byte) (*ExpectedMessage, error) {
 	mm := &message.Message{}
 	mm.Parse(message.New(topic, action, data))
+	id := mm.String()
+
+	ds.emu.RLock()
+	if _, ok := ds.expectedMessages[id]; ok {
+		defer ds.emu.RUnlock()
+		return ds.expectedMessages[id], nil
+	}
+	ds.emu.RUnlock()
 
 	// create a expected message with a parsed message and a
 	// channel to send events when the expected message is found
-	exm := ExpectedMessage{
+	exm := &ExpectedMessage{
+		ID:          mm.String(),
 		ShouldClose: shouldClose,
 		Message:     mm,
-		Channel:     make(FutureMessage),
+		Channels:    channels.New(),
+		Matcher:     matcher,
 	}
 
 	// insert expected message into list
 	ds.emu.Lock()
 	defer ds.emu.Unlock()
 
-	ds.expectedMessages = append(ds.expectedMessages, exm)
-
-	return exm.Channel
+	ds.expectedMessages[exm.ID] = exm
+	return exm, nil
 }
 
 // ExpectMessage checks every message for the expected one
 // when found sends a event through a channel with the message
-func (ds *DeepStream) ExpectMessage(topic topics.Topic, action actions.Action, data ...[]byte) FutureMessage {
-	return ds.expectMessage(false, topic, action, data...)
+func (ds *DeepStream) ExpectMessage(topic topics.Topic, action actions.Action, data ...[]byte) (*ExpectedMessage, error) {
+	return ds.expectMessage(false, nil, topic, action, data...)
 }
 
 // ExpectMessageOnce checks every message for the expected one
 // when found sends a event through a channel with the message
 // after the first event is sent, the channel is closed automatically
-func (ds *DeepStream) ExpectMessageOnce(topic topics.Topic, action actions.Action, data ...[]byte) FutureMessage {
-	return ds.expectMessage(true, topic, action, data...)
+func (ds *DeepStream) ExpectMessageOnce(topic topics.Topic, action actions.Action, data ...[]byte) (*ExpectedMessage, error) {
+	return ds.expectMessage(true, nil, topic, action, data...)
+}
+
+func (ds *DeepStream) ExpectMessageWithMatcher(matcher *message.Matcher, topic topics.Topic, action actions.Action, data ...[]byte) (*ExpectedMessage, error) {
+	return ds.expectMessage(false, matcher, topic, action, data...)
+}
+
+func (ds *DeepStream) Unexpect(id string) error {
+	ds.expectedMessages[id].Channels.Close()
+
+	//ds.emu.Lock()
+	//defer ds.emu.Unlock()
+	delete(ds.expectedMessages, id)
+
+	return nil
 }
